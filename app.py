@@ -41,13 +41,10 @@ def split_pipes(val):
     return list(dict.fromkeys(x.strip() for x in str(val).split("|") if x.strip()))
 
 
-@st.cache_data
-def load_data(path):
-    if not Path(path).exists():
-        raise FileNotFoundError(f"Dataset not found at '{path}'. Run generate_dataset.py first.")
-    df = pd.read_csv(path).drop_duplicates(subset=["Researcher_ID"]).reset_index(drop=True)
+def clean_df(df):
+    df = df.drop_duplicates(subset=["Researcher_ID"]).reset_index(drop=True)
     for col in df.columns:
-        if col not in ("Team_Size", "Availability_Hours", "Match_Score"):
+        if col not in ("Team_Size", "Availability_Hours", "Match_Score", "Role_Group", "Project_Date", "Project_Month"):
             df[col] = df[col].fillna("Unspecified").astype(str).str.strip()
     df["Team_Size"] = pd.to_numeric(df["Team_Size"], errors="coerce").fillna(3).astype(int)
     df["Availability_Hours"] = pd.to_numeric(df["Availability_Hours"], errors="coerce").fillna(8).astype(int)
@@ -56,6 +53,13 @@ def load_data(path):
     df["Project_Date"] = pd.to_datetime(df["Project_Description"].str.extract(r"\[Initiated:\s*(\d{4}-\d{2}-\d{2})\]", expand=False), errors="coerce")
     df["Project_Month"] = df["Project_Date"].dt.to_period("M").astype(str).fillna("Unknown")
     return df
+
+
+@st.cache_data
+def load_data(path):
+    if not Path(path).exists():
+        raise FileNotFoundError(f"Dataset not found at '{path}'. Run generate_dataset.py first.")
+    return clean_df(pd.read_csv(path))
 
 
 @st.cache_data
@@ -680,22 +684,102 @@ def render_simulator(full_df, filtered_df):
         )
 
 
+def live_data_controls(base_df):
+    if "live_rows" not in st.session_state:
+        st.session_state["live_rows"] = []
+
+    df = base_df.copy()
+    depts = sorted(base_df["Department"].unique())
+    doms = sorted(base_df["Research_Domain"].unique())
+    all_int = sorted({t for v in base_df["Research_Interests"] for t in split_pipes(v)})
+    all_skl = sorted({s for v in base_df["Technical_Skills"] for s in split_pipes(v)})
+
+    with st.sidebar.expander("Live Data & CSV Upload"):
+        up = st.file_uploader("Upload Live CSV", type=["csv"])
+        mode = st.radio("Upload Mode", ["Append to Dataset", "Replace Dataset"], horizontal=True)
+        if up is not None:
+            try:
+                up_df = pd.read_csv(up)
+                req_cols = {"Researcher_ID", "Researcher_Name", "Department", "Research_Domain", "Research_Interests", "Technical_Skills", "Project_Title"}
+                if not req_cols.issubset(up_df.columns):
+                    st.error(f"Missing columns: {', '.join(sorted(req_cols - set(up_df.columns)))}")
+                else:
+                    for col in base_df.columns:
+                        if col not in up_df.columns and col not in ("Role_Group", "Project_Date", "Project_Month"):
+                            up_df[col] = "Unspecified"
+                    df = up_df if mode == "Replace Dataset" else pd.concat([up_df, df], ignore_index=True)
+                    df = clean_df(df)
+                    st.success(f"Loaded {len(up_df):,} uploaded row(s).")
+            except Exception as exc:
+                st.error(f"CSV error: {exc}")
+
+        with st.form("add_researcher_form", clear_on_submit=True):
+            st.markdown("**Add Live Researcher / Project**")
+            name = st.text_input("Researcher Name", placeholder="e.g., Diya Munshi")
+            role = st.selectbox("Role", ["PG Student", "UG Student", "PhD Scholar", "Faculty"])
+            dept = st.selectbox("Department", depts)
+            dom = st.selectbox("Research Domain", doms)
+            p_dom = st.selectbox("Preferred Collaboration Domain", doms)
+            p_dept = st.selectbox("Preferred Department", depts)
+            ints = st.multiselect("Research Interests", all_int, default=all_int[:2])
+            skls = st.multiselect("Technical Skills", all_skl, default=all_skl[:2])
+            req_skls = st.multiselect("Required Project Skills", all_skl, default=all_skl[:3])
+            proj_title = st.text_input("Project Title", placeholder="e.g., Smart Campus Analytics")
+            meth = st.selectbox("Methodology", METHODOLOGIES)
+            status = st.selectbox("Collaboration Status", ["Open", "Active", "Ongoing"])
+            team_sz = st.slider("Team Size", 2, 6, 4)
+            if st.form_submit_button("Add to Live Dashboard", width="stretch"):
+                if not name.strip() or not proj_title.strip():
+                    st.warning("Enter both Researcher Name and Project Title.")
+                else:
+                    next_num = len(df) + len(st.session_state["live_rows"]) + 1
+                    today = pd.Timestamp.today().strftime("%Y-%m-%d")
+                    new_row = {
+                        "Researcher_ID": f"RNX-{next_num:04d}", "Researcher_Name": name.strip(), "Role": role,
+                        "Department": dept, "Programme": "MCA" if "Student" in role else "Faculty", "Year_of_Study": "2nd Year" if "Student" in role else "Senior",
+                        "Research_Domain": dom, "Research_Interests": "|".join(ints) or "Applied AI",
+                        "Technical_Skills": "|".join(skls) or "Python", "Research_Methodology": meth,
+                        "Experience_Level": "Intermediate", "Preferred_Collaboration_Domain": p_dom,
+                        "Project_Title": proj_title.strip(),
+                        "Project_Description": f"Live entry added via dashboard [Initiated: {today}]",
+                        "Required_Skills": "|".join(req_skls) or "Python", "Preferred_Department": p_dept,
+                        "Team_Size": team_sz, "Availability_Hours": 10, "Collaboration_Status": status, "Match_Score": 0.0,
+                    }
+                    top5_mean = score_pool(new_row, df, team_size=team_sz)["Compatibility_Score"].nlargest(5).mean()
+                    new_row["Match_Score"] = round(float(top5_mean), 2)
+                    st.session_state["live_rows"].append(new_row)
+                    st.rerun()
+
+        if st.session_state["live_rows"]:
+            st.caption(f"Live entries added: **{len(st.session_state['live_rows'])}**")
+            if st.button("Clear Live Entries", width="stretch"):
+                st.session_state["live_rows"] = []
+                st.rerun()
+
+    if st.session_state["live_rows"]:
+        df = clean_df(pd.concat([pd.DataFrame(st.session_state["live_rows"]), df], ignore_index=True))
+    return df
+
+
 # --- Main App ---
 def main():
     try:
-        full_df = load_data(str(DATA_PATH))
+        base_df = load_data(str(DATA_PATH))
     except Exception as exc:
         st.error(f"Could not load dataset: {exc}")
         st.stop()
 
+    full_df = live_data_controls(base_df)
     filtered_df = sidebar_filters(full_df)
     proj_df = get_unique_projects(filtered_df)
 
     st.title("RESEARCHNEXUS")
     st.caption("CHRIST (Deemed to be University), Bengaluru | Interdisciplinary Research Intelligence & Collaboration Analytics")
+    live_n = len(st.session_state.get("live_rows", []))
+    live_badge = f" :red-badge[Live Added: {live_n}]" if live_n else ""
     st.markdown(
         f":blue-badge[{len(filtered_df):,} Researchers] :green-badge[{len(proj_df):,} Unique Projects] "
-        f":violet-badge[{filtered_df['Department'].nunique()} Departments] :orange-badge[{filtered_df['Research_Domain'].nunique()} Domains]"
+        f":violet-badge[{filtered_df['Department'].nunique()} Departments] :orange-badge[{filtered_df['Research_Domain'].nunique()} Domains]{live_badge}"
     )
 
     section = st.radio("Navigation", SECTIONS, horizontal=True, label_visibility="collapsed")
